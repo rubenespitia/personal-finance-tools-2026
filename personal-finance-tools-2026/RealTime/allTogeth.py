@@ -43,8 +43,8 @@ warnings.filterwarnings("ignore")
 #  CONFIGURACIÓN
 # ─────────────────────────────────────────────
 TICKER         = sys.argv[1].upper() if len(sys.argv) > 1 else "NVDA"
-INTERVALO_S    = int(sys.argv[2])    if len(sys.argv) > 2 else 8
-REFRESCO_NEWS  = int(sys.argv[3])    if len(sys.argv) > 3 else 180
+INTERVALO_S    = int(sys.argv[2])    if len(sys.argv) > 2 else 5
+REFRESCO_NEWS  = int(sys.argv[3])    if len(sys.argv) > 3 else 30
 HISTORIAL      = 120
 PERIODO_HIST   = "5d"
 MAX_NOTICIAS   = 12
