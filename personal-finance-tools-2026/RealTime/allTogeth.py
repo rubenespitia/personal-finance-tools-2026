@@ -9,9 +9,9 @@ Requisitos:
     python -m textblob.download_corpora
 
 Uso:
-    python stock_monitor_integrated.py
-    python stock_monitor_integrated.py AAPL
-    python stock_monitor_integrated.py TSLA 10 120
+    python stock_monitor_fixed.py
+    python stock_monitor_fixed.py AAPL
+    python stock_monitor_fixed.py TSLA 10 120
       (ticker, segundos entre precio, segundos entre noticias)
 """
 
@@ -29,7 +29,7 @@ import matplotlib.animation as animation
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
 import feedparser
@@ -43,10 +43,12 @@ warnings.filterwarnings("ignore")
 #  CONFIGURACIÓN
 # ─────────────────────────────────────────────
 TICKER         = sys.argv[1].upper() if len(sys.argv) > 1 else "NVDA"
-INTERVALO_S    = int(sys.argv[2])    if len(sys.argv) > 2 else 5
+INTERVALO_S     = int(sys.argv[2])   if len(sys.argv) > 2 else 60  # fetch datos (velas de 1m)
+REFRESCO_GRAF_S = 2                  # refresco visual independiente (segundos)
 REFRESCO_NEWS  = int(sys.argv[3])    if len(sys.argv) > 3 else 30
-HISTORIAL      = 120
-PERIODO_HIST   = "5d"
+HISTORIAL      = 390          # máx puntos en deque (1 día de minutos)
+PERIODO_HIST   = "1d"         # solo cargar hoy para no mezclar días
+VENTANA_MINS   = 60           # ventana visible en el eje X (minutos)
 MAX_NOTICIAS   = 12
 RESUMEN_CHARS  = 80
 
@@ -251,7 +253,14 @@ def cargar_historico():
     df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
     with estado.lock:
         for ts, row in df.iterrows():
-            t_naive = ts.replace(tzinfo=None) if hasattr(ts, "tzinfo") else ts
+            # Convertir a hora local (igual que fetch_precio) para que historico
+            # y datos en tiempo real usen la misma referencia de tiempo.
+            # .replace(tzinfo=None) DESCARTA la TZ sin convertir → salto de horas.
+            ts_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+            if getattr(ts_dt, "tzinfo", None) is not None:
+                t_naive = ts_dt.astimezone().replace(tzinfo=None)
+            else:
+                t_naive = ts_dt
             estado.tiempos.append(t_naive)
             estado.precios.append(float(row["Close"]))
             estado.volumenes.append(float(row["Volume"]))
@@ -268,44 +277,52 @@ def cargar_historico():
 #  HILOS DE DATOS
 # ─────────────────────────────────────────────
 def fetch_precio():
-    t = estado.ticker_obj
+    # Crear nuevo objeto Ticker cada vez para evitar caché interno de yfinance.
+    # fast_info reutiliza datos obsoletos si se llama sobre el mismo objeto.
+    t = yf.Ticker(TICKER)
     try:
-        fi = t.fast_info
-        return float(fi.last_price), float(fi.three_month_average_volume or 0)
-    except Exception:
-        pass
-    try:
+        # Jalamos el último minuto real del intraday — es la fuente más fresca.
         df = t.history(period="1d", interval="1m", auto_adjust=True)
         if not df.empty:
             df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-            return float(df["Close"].iloc[-1]), float(df["Volume"].iloc[-1])
+            fila = df.iloc[-1]
+            ts_raw = df.index[-1]
+            # Convertir timestamp de la vela a naive datetime local
+            ts = ts_raw.to_pydatetime()
+            if ts.tzinfo is not None:
+                ts = ts.astimezone().replace(tzinfo=None)
+            return float(fila["Close"]), float(fila["Volume"]), ts
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
 
 def hilo_datos():
     while estado.running:
-        precio, volumen = fetch_precio()
-        if precio:
-            now = datetime.now().replace(microsecond=0)
+        precio, volumen, ts_vela = fetch_precio()
+        if precio and ts_vela:
             with estado.lock:
-                estado.tiempos.append(now)
-                estado.precios.append(precio)
-                estado.volumenes.append(volumen or 0)
-                arr  = np.array(estado.precios)
-                rsi  = calcular_rsi(arr)
-                m, ms, mh = calcular_macd(arr)
-                estado.rsi.append(rsi)
-                estado.macd.append(m); estado.macd_sig.append(ms); estado.macd_hist.append(mh)
+                # Deduplicar: solo agregar si es una vela nueva (timestamp distinto)
+                ultimo_ts = estado.tiempos[-1] if estado.tiempos else None
+                if ultimo_ts is None or ts_vela > ultimo_ts:
+                    estado.tiempos.append(ts_vela)
+                    estado.precios.append(precio)
+                    estado.volumenes.append(volumen or 0)
+                    arr  = np.array(estado.precios)
+                    rsi  = calcular_rsi(arr)
+                    m, ms, mh = calcular_macd(arr)
+                    estado.rsi.append(rsi)
+                    estado.macd.append(m); estado.macd_sig.append(ms); estado.macd_hist.append(mh)
+                # Siempre actualizar estado.ultimo para el título aunque no haya vela nueva
                 prev     = estado.precios[-2] if len(estado.precios) >= 2 else precio
                 cambio   = precio - prev
                 cambio_p = (cambio / prev * 100) if prev else 0
                 estado.ultimo = {
                     "precio": precio, "prev": prev, "cambio": cambio,
                     "cambio_p": cambio_p, "volumen": volumen or 0,
-                    "rsi": rsi, "macd": m, "macd_sig": ms, "macd_hist": mh,
-                    "hora": now.strftime("%H:%M:%S"), "fecha": now.strftime("%d %b %Y"),
+                    "rsi": estado.rsi[-1] if estado.rsi else 50,
+                    "hora": ts_vela.strftime("%H:%M:%S"),
+                    "fecha": ts_vela.strftime("%d %b %Y"),
                 }
         time.sleep(INTERVALO_S)
 
@@ -355,10 +372,11 @@ def iniciar_grafica():
         top=0.93, bottom=0.06, left=0.05, right=0.98
     )
 
-    ax1 = fig.add_subplot(gs[0, 0])   # Precio
-    ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)  # MACD
-    ax3 = fig.add_subplot(gs[2, 0], sharex=ax1)  # RSI
-    ax_news = fig.add_subplot(gs[:, 2])            # Noticias
+    # ── IMPORTANTE: NO usar sharex para evitar conflictos de límites ──
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax3 = fig.add_subplot(gs[2, 0])
+    ax_news = fig.add_subplot(gs[:, 2])
 
     def _estilo_ax(ax, etiq):
         ax.set_facecolor(CF)
@@ -438,7 +456,6 @@ def iniciar_grafica():
             ax.text(0.04, y, label,
                     va="top", fontsize=6.5, color=color_b,
                     transform=ax.transAxes)
-            # barra
             rect = mpatches.FancyBboxPatch(
                 (0.30, y - 0.009), bar_w, 0.013,
                 boxstyle="round,pad=0.001",
@@ -483,14 +500,12 @@ def iniciar_grafica():
             score   = n["score"]
             etiq    = n["etiq"]
 
-            # Emoji + etiqueta + score
             emoji = {"POSITIVE": "🟢", "NEGATIVE": "🔴", "NEUTRAL": "⚪"}[etiq]
             ax.text(0.04, y,
                     f"{emoji} {etiq[:3]}  {score:+.2f}",
                     va="top", fontsize=6, color=color_n,
                     transform=ax.transAxes)
 
-            # Barra visual de score  ◄──●──►
             bx    = 0.40
             bw    = 0.52
             mitad = bx + bw / 2
@@ -503,7 +518,6 @@ def iniciar_grafica():
                     ms=4, color=color_n, transform=ax.transAxes, clip_on=False)
             y -= 0.020
 
-            # Título recortado
             titulo = n["titulo"]
             if len(titulo) > 52:
                 titulo = titulo[:50] + "…"
@@ -512,7 +526,6 @@ def iniciar_grafica():
                     transform=ax.transAxes, wrap=False)
             y -= 0.020
 
-            # Fuente + hace cuánto
             age = hace_cuanto(n["fecha"])
             ax.text(0.04, y,
                     f"  {n['fuente']}  ·  {age} ago",
@@ -520,7 +533,6 @@ def iniciar_grafica():
                     transform=ax.transAxes)
             y -= 0.014
 
-            # Separador entre noticias
             ax.plot([0.02, 0.98], [y, y], color="#1c2128", lw=0.5,
                     transform=ax.transAxes, clip_on=False)
             y -= 0.010
@@ -536,10 +548,29 @@ def iniciar_grafica():
             macd_sigs = list(estado.macd_sig)
             macd_hist = list(estado.macd_hist)
 
-        p0       = precios[0]
+        # ── Ventana rodante: siempre mostramos los últimos VENTANA_MINS ──
+        # t_max = último dato + pequeño padding para que no quede pegado al borde
+        # t_min = t_max - ventana fija
+        # Así el eje X SIEMPRE avanza hacia la derecha con cada nuevo dato.
+        t_max = tiempos[-1] + timedelta(seconds=INTERVALO_S * 3)
+        t_min = t_max - timedelta(minutes=VENTANA_MINS)
+
+        # Filtrar solo los puntos dentro de la ventana visible
+        indices_vis   = [i for i, t in enumerate(tiempos) if t >= t_min]
+        if not indices_vis:
+            indices_vis = list(range(len(tiempos)))
+        tiempos_vis   = [tiempos[i]   for i in indices_vis]
+        precios_vis   = [precios[i]   for i in indices_vis]
+        rsi_vis       = [rsi_vals[i]  for i in indices_vis]
+        macd_vis      = [macd_vals[i] for i in indices_vis]
+        macd_sig_vis  = [macd_sigs[i] for i in indices_vis]
+        macd_hist_vis = [macd_hist[i] for i in indices_vis]
+
+        # Precio actual y cambio (siempre del dato más reciente vs apertura de ventana)
         p_ult    = precios[-1]
-        cambio   = p_ult - p0
-        cambio_p = (cambio / p0 * 100) if p0 else 0
+        p0_vis   = precios_vis[0]
+        cambio   = p_ult - p0_vis
+        cambio_p = (cambio / p0_vis * 100) if p0_vis else 0
         color_l  = CVE if cambio >= 0 else CRO
 
         for ax, etiq in zip(paneles_graf, ["Precio en Vivo", "MACD", "RSI (14)"]):
@@ -547,24 +578,24 @@ def iniciar_grafica():
             _estilo_ax(ax, etiq)
 
         # ── Panel 1: Precio ─────────────────
-        ax1.plot(tiempos, precios, color=color_l, lw=1.8, zorder=4)
-        ax1.fill_between(tiempos, precios, min(precios),
+        ax1.plot(tiempos_vis, precios_vis, color=color_l, lw=1.8, zorder=4)
+        ax1.fill_between(tiempos_vis, precios_vis, min(precios_vis),
                          alpha=0.12, color=color_l)
-        idx_min = int(np.argmin(precios))
-        idx_max = int(np.argmax(precios))
-        ax1.scatter([tiempos[idx_min]], [precios[idx_min]], color=CRO, s=45, zorder=5)
-        ax1.scatter([tiempos[idx_max]], [precios[idx_max]], color=CVE, s=45, zorder=5)
-        ax1.annotate(f"Min ${precios[idx_min]:.2f}",
-                     xy=(tiempos[idx_min], precios[idx_min]),
+        idx_min = int(np.argmin(precios_vis))
+        idx_max = int(np.argmax(precios_vis))
+        ax1.scatter([tiempos_vis[idx_min]], [precios_vis[idx_min]], color=CRO, s=45, zorder=5)
+        ax1.scatter([tiempos_vis[idx_max]], [precios_vis[idx_max]], color=CVE, s=45, zorder=5)
+        ax1.annotate(f"Min ${precios_vis[idx_min]:.2f}",
+                     xy=(tiempos_vis[idx_min], precios_vis[idx_min]),
                      xytext=(5, -13), textcoords="offset points",
                      color=CRO, fontsize=7)
-        ax1.annotate(f"Max ${precios[idx_max]:.2f}",
-                     xy=(tiempos[idx_max], precios[idx_max]),
+        ax1.annotate(f"Max ${precios_vis[idx_max]:.2f}",
+                     xy=(tiempos_vis[idx_max], precios_vis[idx_max]),
                      xytext=(5, 6), textcoords="offset points",
                      color=CVE, fontsize=7)
         arrow = "▲" if cambio >= 0 else "▼"
         ax1.annotate(f"  ${p_ult:.2f}  {arrow} {cambio_p:+.2f}%",
-                     xy=(tiempos[-1], p_ult),
+                     xy=(tiempos_vis[-1], p_ult),
                      color=color_l, fontsize=7, fontweight="bold", va="center")
         ax1.set_ylabel("Price (USD)", color=CT)
         ax1.text(0.998, 0.97, f"Updated: {tiempos[-1].strftime('%H:%M:%S')}",
@@ -572,35 +603,38 @@ def iniciar_grafica():
                  fontsize=7.5, va="top", ha="right")
 
         # ── Panel 2: MACD ───────────────────
-        colores_h = [CVE if v >= 0 else CRO for v in macd_hist]
-        ax2.bar(tiempos, macd_hist, color=colores_h, alpha=0.6, width=0.00035)
-        ax2.plot(tiempos, macd_vals, color=CAZ, lw=1.2, label="MACD")
-        ax2.plot(tiempos, macd_sigs, color=CNA, lw=1.2, label="Signal")
+        colores_h = [CVE if v >= 0 else CRO for v in macd_hist_vis]
+        ax2.bar(tiempos_vis, macd_hist_vis, color=colores_h, alpha=0.6, width=0.00035)
+        ax2.plot(tiempos_vis, macd_vis, color=CAZ, lw=1.2, label="MACD")
+        ax2.plot(tiempos_vis, macd_sig_vis, color=CNA, lw=1.2, label="Signal")
         ax2.axhline(0, color=CS, lw=0.8)
         ax2.set_ylabel("MACD", color=CT)
         ax2.legend(facecolor="#161b22", labelcolor=CT, fontsize=7, loc="upper left")
 
         # ── Panel 3: RSI ────────────────────
-        ax3.plot(tiempos, rsi_vals, color=CMO, lw=1.2)
+        ax3.plot(tiempos_vis, rsi_vis, color=CMO, lw=1.2)
         ax3.axhline(70, color=CRO, lw=0.8, ls="--", alpha=0.7)
         ax3.axhline(30, color=CVE, lw=0.8, ls="--", alpha=0.7)
         ax3.axhline(50, color=CS,  lw=0.5, ls=":")
-        ax3.fill_between(tiempos, rsi_vals, 70,
-                         where=[r >= 70 for r in rsi_vals],
+        ax3.fill_between(tiempos_vis, rsi_vis, 70,
+                         where=[r >= 70 for r in rsi_vis],
                          alpha=0.2, color=CRO)
-        ax3.fill_between(tiempos, rsi_vals, 30,
-                         where=[r <= 30 for r in rsi_vals],
+        ax3.fill_between(tiempos_vis, rsi_vis, 30,
+                         where=[r <= 30 for r in rsi_vis],
                          alpha=0.2, color=CVE)
         ax3.set_ylim(0, 100)
         ax3.set_ylabel("RSI", color=CT)
-        rsi_now = rsi_vals[-1] if rsi_vals else 50
+        rsi_now = rsi_vis[-1] if rsi_vis else 50
         rsi_col = CRO if rsi_now > 70 else CVE if rsi_now < 30 else CMO
         ax3.text(0.998, 0.5, f"{rsi_now:.1f}",
                  transform=ax3.transAxes, color=rsi_col,
                  fontsize=9, fontweight="bold", va="center", ha="right")
 
-        # Eje X
+        # ── Ventana rodante fija en los 3 paneles ───────────────────────
+        # set_xlim explícito DESPUÉS de dibujar — esto es lo que hace que
+        # el timeline avance hacia la derecha en vez de resetearse.
         for ax in paneles_graf:
+            ax.set_xlim(t_min, t_max)
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
             ax.xaxis.set_major_locator(mdates.AutoDateLocator())
             plt.setp(ax.xaxis.get_majorticklabels(), color=CT, fontsize=7.5, rotation=0)
@@ -617,7 +651,7 @@ def iniciar_grafica():
 
     ani = animation.FuncAnimation(
         fig, actualizar,
-        interval=INTERVALO_S * 1000,
+        interval=REFRESCO_GRAF_S * 1000,
         cache_frame_data=False
     )
 
@@ -639,13 +673,9 @@ if __name__ == "__main__":
     if not cargar_historico():
         sys.exit(1)
 
-    # Hilo de precio
     threading.Thread(target=hilo_datos, daemon=True).start()
-
-    # Hilo de noticias (arranca inmediatamente)
     threading.Thread(target=hilo_noticias, daemon=True).start()
 
-    # Esperar primer precio real
     console.print("[yellow]⏳ Esperando primer precio...[/yellow]")
     for _ in range(20):
         if estado.ultimo:
