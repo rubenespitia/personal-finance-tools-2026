@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore")
 TICKER    = "NVDA"     # Símbolo de la acción (ej. MSFT, TSLA, GOOGL)
 PERIODO   = "6mo"      # 1mo, 3mo, 6mo, 1y, 2y, 5y
 INTERVALO = "1d"       # 1d, 1wk, 1mo
-DIAS_PRED = 120         # Días a predecir en el futuro
+DIAS_PRED = 360         # Días a predecir en el futuro
 
 
 # ─────────────────────────────────────────────
